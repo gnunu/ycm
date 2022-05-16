@@ -1,19 +1,37 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"time"
 
 	coordv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	coordclientset "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	listercoordv1 "k8s.io/client-go/listers/coordination/v1"
+	"k8s.io/klog"
+	"k8s.io/utils/clock"
+	"k8s.io/utils/pointer"
 
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+)
+
+const (
+	AnnotationKeyNodeAutonomy string = "node.beta.openyurt.io/autonomy" // nodeutil.AnnotationKeyNodeAutonomy
+)
+
+var (
+	g_leaseClient coordclientset.LeaseInterface
+
+	//leaseRenewalPeriod time.Duration = 180 * time.Second
+	leaseRenewalPeriod time.Duration = 60 * time.Second
 )
 
 // Node is abstrcation of k8s Node
@@ -22,26 +40,36 @@ type Node struct {
 	autonomy   bool
 	obj        *v1.Node
 	statusTime metav1.Timestamp
-	leaseTime  metav1.Timestamp
+	leaseTime  *metav1.MicroTime
 	lease      *coordv1.Lease // lease related to this node
 }
 
-func newNodeWithObj(obj *v1.Node) *Node {
-	return &Node{
-		name:     obj.Name,
-		autonomy: false,
-		obj:      obj,
+func nodeAutonomyAnnotated(node *v1.Node) bool {
+	fmt.Printf("nodeAutonomyAnnotated: %v\n", node.Annotations[AnnotationKeyNodeAutonomy])
+	if node.Annotations != nil && node.Annotations[AnnotationKeyNodeAutonomy] == "true" {
+		fmt.Printf("autonomy annotation: %v\n", node.Annotations[AnnotationKeyNodeAutonomy])
+		return true
 	}
-}
-
-func newNodeWithName(name string) *Node {
-	return &Node{
-		name:     name,
-		autonomy: false,
-	}
+	return false
 }
 
 func (node *Node) updatedEnough() bool {
+	if node.leaseTime == nil {
+		return false
+	}
+	future := node.leaseTime.Add(leaseRenewalPeriod)
+	now := metav1.NowMicro().Time
+	if node.name == "ai-ice-vm05" {
+		fmt.Printf("ai-ice-vm05:\n")
+		fmt.Printf("leaseTime:\t%v\n", node.leaseTime)
+		fmt.Printf("future:\t\t%v\n", future)
+		fmt.Printf("now:\t\t%v\n", now)
+	}
+	if future.Before(now) {
+		fmt.Printf("updateEnough: false\n")
+		return false
+	}
+	fmt.Printf("updateEnough: true\n")
 	return true
 }
 
@@ -54,24 +82,59 @@ func (node *Node) check() {
 		return
 	}
 
-	if node.labeledAutonomy() {
-		if node.alreadyTainted() {
-			return
+	if node.isAutonomy() {
+		if node.name == "ai-ice-vm05" {
+			node.renewLease()
 		}
-		node.taint()
 	}
 }
 
-func (node *Node) labeledAutonomy() bool {
-	return true
+func (node *Node) isAutonomy() bool {
+	return node.autonomy
+}
+
+func (node *Node) newLease() *coordv1.Lease {
+	nl := &coordv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      node.name,
+			Namespace: v1.NamespaceNodeLease,
+		},
+		Spec: coordv1.LeaseSpec{
+			HolderIdentity:       pointer.StringPtr(node.name),
+			LeaseDurationSeconds: pointer.Int32Ptr(40),
+		},
+	}
+	return nl
+}
+
+func (node *Node) renewLease() {
+	var nl *coordv1.Lease
+	if node.lease != nil {
+		nl = node.lease.DeepCopy()
+	} else {
+		nl = node.newLease()
+	}
+	nl.Spec.RenewTime = &metav1.MicroTime{Time: clock.RealClock{}.Now()}
+	fmt.Printf("renew lease: %v\n", nl)
+	lease, err := g_leaseClient.Update(context.Background(), nl, metav1.UpdateOptions{})
+	if err != nil {
+		fmt.Printf("renew lease error: %v\n", err)
+		// renew lease error: leases.coordination.k8s.io "ai-ice-vm05" is invalid: metadata.resourceVersion: Invalid value: 0x0: must be specified for an update
+	} else {
+		fmt.Printf("renewed lease: %v\n", lease)
+	}
+
 }
 
 func (node *Node) updateLease(lease *coordv1.Lease) {
 	node.lease = lease
+	node.leaseTime = lease.Spec.RenewTime
+	fmt.Printf("node: %s, lease renew: %v\n", node.name, *node.leaseTime)
 }
 
 // add taint for those node marked as autonomy but status unoknown
 func (node *Node) taint() {
+	node.lease.Annotations["delegation"] = "true"
 }
 
 type NodePool struct {
@@ -81,6 +144,7 @@ type NodePool struct {
 }
 
 type NodeMap map[string]*Node
+
 type NodePoolMap map[string]*NodePool
 
 func (nm NodeMap) updateLease(lease *coordv1.Lease) {
@@ -89,7 +153,7 @@ func (nm NodeMap) updateLease(lease *coordv1.Lease) {
 		fmt.Printf("no node %s yet\n", lease.Name)
 		return
 	}
-	node.lease = lease
+	node.updateLease(lease)
 }
 
 var nodeMap NodeMap = make(map[string]*Node)
@@ -110,12 +174,13 @@ func onNodeAdd(o interface{}) {
 	fmt.Println("node add:")
 	oo := o.(*v1.Node)
 	fmt.Printf("%s\n", oo.Name)
+	fmt.Printf("%v\n", oo.Annotations)
 	nodeMap[oo.Name] = &Node{
 		name:     oo.Name,
-		autonomy: false,
+		autonomy: nodeAutonomyAnnotated(oo),
 		obj:      oo,
 	}
-	fmt.Printf("nodeMap=%v\n", nodeMap)
+	fmt.Printf("node added: %v\n", nodeMap[oo.Name])
 }
 
 func onNodeDelete(o interface{}) {
@@ -128,11 +193,19 @@ func onNodeDelete(o interface{}) {
 func onLeaseUpdate(o interface{}, n interface{}) {
 	//oo := o.(*coordv1.Lease)
 	//fmt.Println("<<<<<<<< old lease:")
-	//fmt.Printf("%v\n", oo)
 	no := n.(*coordv1.Lease)
-	fmt.Printf("lease update: %s\n", no.Name)
 	//fmt.Println(">>>>>>>> new lease:")
 	//fmt.Printf("%v\n", no)
+
+	/*
+		fmt.Printf("Annotations: %v\n", no.Annotations)
+		fmt.Printf("Spec.HolderIdentity: %v\n", no.Spec.HolderIdentity)
+		fmt.Printf("Spec.AcquireTime: %v\n", no.Spec.AcquireTime)
+		fmt.Printf("Spec.LeaseDurationSeconds: %d\n", *no.Spec.LeaseDurationSeconds) // 40
+		fmt.Printf("Spec.LeaseTransitions: %v\n", no.Spec.LeaseTransitions)
+		fmt.Printf("Spec.RenewTime: %v\n", no.Spec.RenewTime)
+	*/
+
 	nodeMap.updateLease(no)
 }
 
@@ -159,34 +232,53 @@ func listLease(leaseLister listercoordv1.LeaseNamespaceLister) {
 }
 
 type controller struct {
-	nodes     NodeMap
-	nodepools NodePoolMap
+	clientset         *kubernetes.Clientset
+	nodes             NodeMap
+	nodepools         NodePoolMap
+	nodeMonitorPeriod time.Duration
 }
 
-func newController() *controller {
+func NewController(
+	clientset *kubernetes.Clientset,
+	nodeMonitorPeriod time.Duration,
+	nodes NodeMap,
+	nodepools NodePoolMap) *controller {
 	return &controller{
-		nodes:     nodeMap,
-		nodepools: nodepoolMap,
+		clientset:         clientset,
+		nodes:             nodes,
+		nodepools:         nodepools,
+		nodeMonitorPeriod: nodeMonitorPeriod,
 	}
 }
 
 // run every minute
-func (nc *controller) MointorNodes() {
+func (nc *controller) monitorNodes() error {
 	// get lease list
 	for _, node := range nc.nodes {
 		go node.check()
 	}
+	return nil
 }
 
 // update nodepool list
-func (nc *controller) MonitorNodepools() {
+func (nc *controller) monitorNodepools() error {
+	return nil
+}
+
+func (nc *controller) Run(stopCh <-chan struct{}) {
+	go wait.Until(func() {
+		if err := nc.monitorNodes(); err != nil {
+			klog.Errorf("Error monitoring node health: %v", err)
+		}
+	}, nc.nodeMonitorPeriod, stopCh)
 
 }
 
 func main() {
 	fmt.Println("nodepoolcoordination controller started.")
 
-	kubeconfig := flag.String("kubeconfig", "/home/nunu/.kube/config.aibox04", "absolute path to the kubeconfig file")
+	//kubeconfig := flag.String("kubeconfig", "/home/nunu/.kube/config.aibox04", "absolute path to the kubeconfig file")
+	kubeconfig := flag.String("kubeconfig", "/home/nunu/.kube/config.ai2-vm21", "absolute path to the kubeconfig file")
 	flag.Parse()
 	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
@@ -197,6 +289,8 @@ func main() {
 	if err != nil {
 		panic(err.Error())
 	}
+
+	g_leaseClient = clientset.CoordinationV1().Leases(v1.NamespaceNodeLease)
 
 	stopper := make(chan struct{})
 	defer close(stopper)
@@ -225,14 +319,9 @@ func main() {
 	})
 	//	leaseInformerSynced = leaseInformer.Informer().HasSynced
 
-	//nc := newController()
+	nc := NewController(clientset, 10*time.Second, nodeMap, nodepoolMap)
 
-	/*	go wait.UntilWithContext(ctx, func(ctx context.Context) {
-			if err := nc.monitorNodeHealth(ctx); err != nil {
-				klog.Errorf("Error monitoring node health: %v", err)
-			}
-		}, nc.nodeMonitorPeriod)
-	*/
+	nc.Run(stopper)
 
 	<-stopper
 }
